@@ -9,6 +9,7 @@ import cv2
 from PIL import Image
 import io
 import time
+import os
 
 # ─────────────────────────────────────────────
 # Page config
@@ -133,10 +134,16 @@ hr { border-color: #2a2f3e; }
 @st.cache_resource(show_spinner=False)
 def load_models(unet_path: str, pix2pix_path: str):
     import tensorflow as tf
-    unet_model    = tf.keras.models.load_model(unet_path,    compile=False)
-    pix2pix_model = tf.keras.models.load_model(pix2pix_path, compile=False)
-    return unet_model, pix2pix_model
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+    UNET_PATH = os.path.join(BASE_DIR, "models", "unet_soft_best-3.keras")
+    PIX2PIX_PATH = os.path.join(BASE_DIR, "models", "pix2pix_gen_e3.keras")
+    DEEPLAB_PATH = os.path.join(BASE_DIR, "models", "deeplab_best-2.keras")
+
+    unet_model = tf.keras.models.load_model(UNET_PATH, compile=False)
+    pix2pix_model = tf.keras.models.load_model(PIX2PIX_PATH, compile=False)
+    deeplab_model = tf.keras.models.load_model(DEEPLAB_PATH, compile=False)
+    return unet_model, pix2pix_model, deeplab_model
 
 # ─────────────────────────────────────────────
 # Image processing helpers
@@ -217,12 +224,12 @@ with st.sidebar:
     st.markdown("### 🗂 Model Weights")
     unet_path    = st.text_input("U-Net weights (.keras)",    value="unet_soft_best-3.keras")
     pix2pix_path = st.text_input("Pix2Pix weights (.keras)", value="pix2pix_gen_e3.keras")
-
+    deeplab_path  = st.text_input("DeepLab weights (.keras)", value="deeplab_best-2.keras")
     st.markdown("---")
     st.markdown("### ⚙️ Inference Settings")
     mask_threshold = st.slider("Mask threshold (U-Net)",  0.10, 0.80, 0.35, 0.05,
                                help="Pixel prob ≥ threshold → signature foreground")
-    run_pipeline   = st.selectbox("Pipeline mode", ["Full (Pix2Pix → U-Net)", "U-Net only", "Pix2Pix only"])
+    run_pipeline   = st.selectbox("Pipeline mode", ["U-Net only", "Pix2Pix only", "DeepLab only"])
 
     st.markdown("---")
     st.markdown("### 🔬 Pipeline")
@@ -341,11 +348,11 @@ if not run_btn:
 # ─────────────────────────────────────────────
 with st.spinner("Loading model weights …"):
     try:
-        unet_model, pix2pix_model = load_models(unet_path, pix2pix_path)
+        unet_model, pix2pix_model, deep = load_models(unet_path, pix2pix_path)
     except Exception as e:
         st.error(f"❌ Failed to load models: {e}")
         st.info(
-            "Make sure `unet_soft_best-3.keras` and `pix2pix_gen_e3.keras` "
+            "Make sure `unet_soft_best-3.keras`, `pix2pix_gen_e3.keras`, and `deeplab_best-2.keras` "
             "are in the same directory as this script, or update the paths in the sidebar."
         )
         st.stop()
@@ -361,7 +368,7 @@ results  = {}
 timing   = {}
 
 # ── Step 1 — Pix2Pix denoising
-if run_pipeline in ("Full (Pix2Pix → U-Net)", "Pix2Pix only"):
+if run_pipeline == "Pix2Pix only":
     progress.progress(15, text="⚡ Step 1/3 — Pix2Pix denoising …")
     t0 = time.time()
 
@@ -378,20 +385,18 @@ if run_pipeline in ("Full (Pix2Pix → U-Net)", "Pix2Pix only"):
     timing["pix2pix"] = time.time() - t0
     progress.progress(40, text="✅ Pix2Pix done")
 
-# ── Step 2 — U-Net segmentation
-if run_pipeline in ("Full (Pix2Pix → U-Net)", "U-Net only"):
-    progress.progress(50, text="⚡ Step 2/3 — U-Net segmentation …")
+# ── Step 2 — Segmentation (U-Net / DeepLab)
+if run_pipeline in ("U-Net only", "DeepLab only"):
+    seg_model_name = "U-Net" if run_pipeline == "U-Net only" else "DeepLab"
+    seg_model = unet_model if run_pipeline == "U-Net only" else deep
+    progress.progress(50, text=f"⚡ Step 2/3 — {seg_model_name} segmentation …")
     t0 = time.time()
 
-    if run_pipeline == "Full (Pix2Pix → U-Net)":
-        seg_input_rgb = y_p2p_rgb          # use Pix2Pix output
-        seg_input_rgb_orig = y_p2p_orig
-    else:
-        seg_input_rgb = cv2.resize(img_rgb, IMG_SIZE, interpolation=cv2.INTER_LINEAR)
-        seg_input_rgb_orig = img_rgb
+    seg_input_rgb = cv2.resize(img_rgb, IMG_SIZE, interpolation=cv2.INTER_LINEAR)
+    seg_input_rgb_orig = img_rgb
 
     x_seg  = np.expand_dims(seg_input_rgb.astype(np.float32) / 255.0, 0)
-    prob   = unet_model.predict(x_seg, verbose=0)[0, ..., 0]   # (512,512)
+    prob   = seg_model.predict(x_seg, verbose=0)[0, ..., 0]   # (512,512)
     mask512 = postprocess_mask(prob, thr=mask_threshold)
 
     # resize mask back to original
@@ -401,18 +406,15 @@ if run_pipeline in ("Full (Pix2Pix → U-Net)", "U-Net only"):
     results["mask_512"]    = mask512
     results["mask_orig"]   = mask_orig
     results["seg_input"]   = seg_input_rgb_orig
-    timing["unet"] = time.time() - t0
-    progress.progress(75, text="✅ U-Net done")
+    results["seg_model_name"] = seg_model_name
+    timing["segmentation"] = time.time() - t0
+    progress.progress(75, text=f"✅ {seg_model_name} done")
 
 # ── Step 3 — Extract signature
 progress.progress(85, text="⚡ Step 3/3 — Extracting signature …")
 t0 = time.time()
 
-if run_pipeline == "Full (Pix2Pix → U-Net)":
-    base_rgb = y_p2p_orig
-    base_01  = base_rgb.astype(np.float32) / 255.0
-    mask_for_extract = results["mask_orig"]
-elif run_pipeline == "U-Net only":
+if run_pipeline in ("U-Net only", "DeepLab only"):
     base_rgb = img_rgb
     base_01  = base_rgb.astype(np.float32) / 255.0
     mask_for_extract = results["mask_orig"]
@@ -444,23 +446,8 @@ tabs = st.tabs(["🖼️ Side-by-Side", "🔬 Detailed Steps", "📊 Metrics", "
 
 # ── TAB 1: Side-by-Side
 with tabs[0]:
-    if run_pipeline == "Full (Pix2Pix → U-Net)":
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.image(pil_input, use_column_width=True)
-            st.markdown("<div class='img-label'>Input (Noisy)</div>", unsafe_allow_html=True)
-        with c2:
-            st.image(results["pix2pix_orig"], use_column_width=True)
-            st.markdown("<div class='img-label'>Pix2Pix Cleaned</div>", unsafe_allow_html=True)
-        with c3:
-            mask_disp = (results["mask_orig"] * 255).astype(np.uint8)
-            st.image(mask_disp, use_column_width=True, clamp=True)
-            st.markdown("<div class='img-label'>U-Net Mask</div>", unsafe_allow_html=True)
-        with c4:
-            st.image(results["extracted_rgb"], use_column_width=True)
-            st.markdown("<div class='img-label'>Extracted Signature</div>", unsafe_allow_html=True)
-
-    elif run_pipeline == "U-Net only":
+    if run_pipeline in ("U-Net only", "DeepLab only"):
+        seg_model_name = results.get("seg_model_name", "Segmentation")
         c1, c2, c3 = st.columns(3)
         with c1:
             st.image(pil_input, use_column_width=True)
@@ -468,7 +455,7 @@ with tabs[0]:
         with c2:
             mask_disp = (results["mask_orig"] * 255).astype(np.uint8)
             st.image(mask_disp, use_column_width=True, clamp=True)
-            st.markdown("<div class='img-label'>U-Net Mask</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='img-label'>{seg_model_name} Mask</div>", unsafe_allow_html=True)
         with c3:
             st.image(results["extracted_rgb"], use_column_width=True)
             st.markdown("<div class='img-label'>Extracted Signature</div>", unsafe_allow_html=True)
@@ -506,7 +493,8 @@ with tabs[1]:
         st.markdown("---")
 
     if "prob_map" in results:
-        st.markdown("**U-Net Segmentation**")
+        seg_model_name = results.get("seg_model_name", "Segmentation")
+        st.markdown(f"**{seg_model_name} Segmentation**")
         c1, c2, c3 = st.columns(3)
         with c1:
             seg_disp = cv2.resize(results["seg_input"], IMG_SIZE)
@@ -548,10 +536,11 @@ with tabs[2]:
 <div class='metric-range'>Denoising pass</div>
 </div>""", unsafe_allow_html=True)
     with tc2:
+        seg_label = results.get("seg_model_name", "Segmentation")
         st.markdown(f"""
 <div class='metric-card'>
-<div class='metric-value'>{timing.get('unet', 0):.2f}s</div>
-<div class='metric-label'>U-Net</div>
+<div class='metric-value'>{timing.get('segmentation', 0):.2f}s</div>
+<div class='metric-label'>{seg_label}</div>
 <div class='metric-range'>Segmentation pass</div>
 </div>""", unsafe_allow_html=True)
     with tc3:
@@ -647,7 +636,8 @@ with tabs[3]:
         dl_items.append(("Pix2Pix cleaned (PNG)", results["pix2pix_orig"], "pix2pix_cleaned.png"))
     if "mask_orig" in results:
         mask_save = (results["mask_orig"] * 255).astype(np.uint8)
-        dl_items.append(("U-Net mask (PNG)", mask_save, "unet_mask.png"))
+        seg_model_name = results.get("seg_model_name", "segmentation").lower()
+        dl_items.append((f"{seg_model_name.title()} mask (PNG)", mask_save, f"{seg_model_name}_mask.png"))
     if "extracted_rgb" in results:
         dl_items.append(("Extracted signature (PNG)", results["extracted_rgb"], "signature_extracted.png"))
     if "sig_bw" in results:
